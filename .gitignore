@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# 虚拟环境
+.venv/
+venv/
+
+# 测试 / 示例产物
+test_output/
+examples/*.dxf
+examples/*.png
+examples/*.pdf
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/
+*.swp
