@@ -581,10 +581,13 @@ def dxf_layers(path: str, layers: list[dict]) -> dict:
 
     每个图层:
       {name(必填), color(可选, 同 color 规则), linetype(可选,
-       如 "Continuous"/"Dashed"/"Center"/"Hidden")}            → 创建/更新
-      {name(必填), rename_to: "新名"}                          → 重命名
-      {name(必填), delete: true}                               → 删除
+       如 "Continuous"/"Dashed"/"Center"/"Hidden"),
+       on(可选 bool), frozen(可选 bool), locked(可选 bool)}     → 创建/更新
+      {name(必填), rename_to: "新名"}                           → 重命名
+      {name(必填), delete: true}                                → 删除
        （非空图层会被保护性拒绝，返回该图层上的实体数提示）
+    状态说明: on=false 关闭图层(不显示不打印) / frozen=true 冻结
+    (不显示且不参与重生成) / locked=true 锁定(显示但不能编辑)。
     文件不存在时先创建。
     """
     try:
@@ -644,6 +647,14 @@ def dxf_layers(path: str, layers: list[dict]) -> dict:
                         raise ValueError(f"线型 {lt} 不存在且无内置 pattern 定义")
                     doc.linetypes.add(lt, pattern)
                 layer.linetype = lt
+            # 图层状态（ezdxf 的编码：off = 颜色取负号；frozen/locked = group 70 位）。
+            # 先设颜色再开关，off 会把颜色变负——所以 on/off 必须放在 color 之后。
+            if spec.get("on") is not None:
+                layer.on() if spec["on"] else layer.off()
+            if spec.get("frozen") is not None:
+                layer.freeze() if spec["frozen"] else layer.thaw()
+            if spec.get("locked") is not None:
+                layer.lock() if spec["locked"] else layer.unlock()
             result.append(name)
         p = _resolve(path)
         if not created:
@@ -1021,7 +1032,14 @@ def _dxf_stats(doc, p: Path) -> dict:
         entity_count=total,
         by_type=by_type,
         extents=extents,
-        layers=[l.dxf.name for l in doc.layers],
+        layers=[
+            {"name": l.dxf.name,
+             "on": l.is_on(),
+             "frozen": l.is_frozen(),
+             "locked": l.is_locked(),
+             "color": l.get_color()}
+            for l in doc.layers
+        ],
         size_bytes=p.stat().st_size,
     )
 

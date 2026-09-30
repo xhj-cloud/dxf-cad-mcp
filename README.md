@@ -24,6 +24,8 @@
 ## 特性
 
 - 16 个 MCP 工具，覆盖完整 2D 绘图 + 编辑工作流（见下表）
+- **图层状态控制**：关闭（不显示不打印）/ 冻结（不显示且不参与重生成）/
+  锁定（显示但不能编辑），渲染预览与 AutoCAD 行为一致
 - **编辑闭环**：`dxf_query` 定位 → `dxf_modify`/`dxf_delete` 修改 →
   自动滚动备份（.bak1~.bak5）→ `dxf_restore` 一键回滚，所有改文件的
   工具（含绘制类）落盘前自动备份
@@ -33,7 +35,7 @@
 - PNG 预览 + 矢量 PDF 导出（auto 自适应或 A4/A3/A2 横版）
 - 中文渲染：启动时自动注册系统 CJK 字体，中文标注/文字预览不空白
 
-## 工具列表（11 个）
+## 工具列表（16 个）
 
 | 工具 | 说明 |
 |------|------|
@@ -43,8 +45,8 @@
 | `dxf_hatch` | 追加填充：solid 实底 / ANSI31 等标准图案；闭合多边形边界 |
 | `dxf_splines` | 追加样条线（过拟合点集的 2/3 阶样条） |
 | `dxf_blocks` | 定义图块（内含 `dxf_draw` 同款实体）并插入引用（旋转/缩放） |
-| `dxf_layers` | 创建/更新/**重命名/删除**图层（颜色：ACI 数字 / 颜色名 / #RRGGBB；线型：Continuous/Dashed/Center/Hidden/Phantom/Dashdot；非空图层删除受保护） |
-| `dxf_read` | 检查图纸（**DXF / DWG 均支持**）：版本、实体统计、类型分布、包围盒、图层；DWG 经 LibreDWG 自动转读 |
+| `dxf_layers` | 创建/更新/**重命名/删除**图层（颜色：ACI 数字 / 颜色名 / #RRGGBB；线型：Continuous/Dashed/Center/Hidden/Phantom/Dashdot；状态：`on`/`frozen`/`locked`；非空图层删除受保护） |
+| `dxf_read` | 检查图纸（**DXF / DWG 均支持**）：版本、实体统计、类型分布、包围盒、图层（含开关/冻结/锁定状态与颜色）；DWG 经 LibreDWG 自动转读 |
 | `dxf_query` | 查找实体（按类型/图层/handle/文字子串），返回 handle + 类型 + 图层 + 摘要；编辑类工具的前置定位 |
 | `dxf_delete` | 删除实体（handle/类型/图层；删 DIMENSION 时同步清空其 *D 图形块） |
 | `dxf_modify` | 修改实体：图层/颜色/线型/文字内容 + 移动/绕点旋转/绕点缩放 |
@@ -126,6 +128,9 @@ dsh（`~/.dsh/profiles/web/cordis.patch.yml`）：
 - DXF 写入版本最高 R2018（AC1032），AutoCAD 2018+ 均可读取
 - 标注预览使用 ezdxf 简化渲染器，与 CAD 显示可能有差异（AutoCAD 打开时按
   定义点重新渲染，**以 CAD 显示为准**）
+- 标注预览颜色：`*D` 几何块实体默认 ByBlock，预览按块所在图层（0）解析，
+  放在彩色标注层的标注预览仍显示白色——给 `*D` 块实体设显式颜色即可让
+  预览跟随；AutoCAD 中按 ByLayer 渲染，终显正确
 - 填充边界仅支持闭合多边形（圆形/弧线边界暂不支持）
 - 仅 model space；布局/图纸空间未实现
 - `dxf_convert_dwg` / DWG 读取走 LibreDWG 开源实现，成熟度低于 Autodesk 官方：
@@ -147,11 +152,16 @@ dxf-cad-mcp/
 │   └── quickstart.py    # 直调示例（无需 MCP 协议）
 ├── test_client.py       # 端到端测试（第一批）
 ├── test_client2.py      # 端到端测试（第二批）
+├── 修复记录/            # 每次修复/更改的带日期 md 记录（README.md 为索引）
 ├── requirements.txt
 ├── pyproject.toml
 ├── LICENSE              # MIT
 └── README.md
 ```
+
+## 修复记录
+
+详见 [修复记录/](修复记录/README.md)（每次修复/更改的带日期记录）。
 
 ## License
 
