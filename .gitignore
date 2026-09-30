@@ -16,6 +16,9 @@ examples/*.dxf
 examples/*.png
 examples/*.pdf
 
+# dxf_restore 自动备份
+*.dxf.bak[1-5]
+
 # 编辑器 / 系统
 .DS_Store
 .idea/

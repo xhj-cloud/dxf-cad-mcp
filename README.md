@@ -23,7 +23,10 @@
 
 ## 特性
 
-- 12 个 MCP 工具，覆盖完整 2D 绘图工作流（见下表）
+- 16 个 MCP 工具，覆盖完整 2D 绘图 + 编辑工作流（见下表）
+- **编辑闭环**：`dxf_query` 定位 → `dxf_modify`/`dxf_delete` 修改 →
+  自动滚动备份（.bak1~.bak5）→ `dxf_restore` 一键回滚，所有改文件的
+  工具（含绘制类）落盘前自动备份
 - 9 种基础实体 + 5 种尺寸标注 + 27 种标准填充图案 + 样条 + 图块
 - 颜色三种写法：ACI 数字 / 颜色名（`"red"`）/ `#RRGGBB` 真彩色
 - 内置标准线型：Dashed / Center / Hidden / Phantom / Dashdot
@@ -40,8 +43,12 @@
 | `dxf_hatch` | 追加填充：solid 实底 / ANSI31 等标准图案；闭合多边形边界 |
 | `dxf_splines` | 追加样条线（过拟合点集的 2/3 阶样条） |
 | `dxf_blocks` | 定义图块（内含 `dxf_draw` 同款实体）并插入引用（旋转/缩放） |
-| `dxf_layers` | 创建/更新图层（颜色：ACI 数字 / 颜色名 / #RRGGBB；线型：Continuous/Dashed/Center/Hidden/Phantom/Dashdot） |
+| `dxf_layers` | 创建/更新/**重命名/删除**图层（颜色：ACI 数字 / 颜色名 / #RRGGBB；线型：Continuous/Dashed/Center/Hidden/Phantom/Dashdot；非空图层删除受保护） |
 | `dxf_read` | 检查图纸（**DXF / DWG 均支持**）：版本、实体统计、类型分布、包围盒、图层；DWG 经 LibreDWG 自动转读 |
+| `dxf_query` | 查找实体（按类型/图层/handle/文字子串），返回 handle + 类型 + 图层 + 摘要；编辑类工具的前置定位 |
+| `dxf_delete` | 删除实体（handle/类型/图层；删 DIMENSION 时同步清空其 *D 图形块） |
+| `dxf_modify` | 修改实体：图层/颜色/线型/文字内容 + 移动/绕点旋转/绕点缩放 |
+| `dxf_restore` | 从自动滚动备份（.bak1 最新 ~ .bak5 最旧）恢复文件 |
 | `dxf_render` | 渲染 PNG 预览（ezdxf + matplotlib，不需要打开 CAD） |
 | `dxf_export_pdf` | 导出矢量 PDF（线条/文字保持矢量，可 auto 自适应或 A4/A3/A2 横版） |
 | `dxf_convert_dwg` | DXF → DWG 转换（LibreDWG dxf2dwg，纯本地；版本 r12/r14/r2000/r2004，默认 r2000） |
@@ -135,7 +142,7 @@ dsh（`~/.dsh/profiles/web/cordis.patch.yml`）：
 
 ```
 dxf-cad-mcp/
-├── server.py            # MCP 服务器（12 个工具）
+├── server.py            # MCP 服务器（16 个工具）
 ├── examples/
 │   └── quickstart.py    # 直调示例（无需 MCP 协议）
 ├── test_client.py       # 端到端测试（第一批）

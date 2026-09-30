@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dxf-cad-mcp"
-version = "0.3.0"
+version = "0.4.0"
 description = "DXF CAD MCP server — let AI agents draw 2D engineering drawings via the MCP protocol (cross-platform, AutoCAD-friendly on macOS)"
 readme = "README.md"
 requires-python = ">=3.10"

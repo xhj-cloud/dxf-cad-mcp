@@ -13,9 +13,14 @@ PNG 预览 → 一键打开到 AutoCAD」的完整流程。
   dxf_hatch           追加填充（solid 实底 / ANSI31 等标准图案，闭合多边形边界）
   dxf_splines         追加样条线（过给定点集的拟合样条，degree 2/3）
   dxf_blocks          定义图块（内含 dxf_draw 同款实体）并插入引用
-  dxf_layers          创建/更新图层（名称、颜色、线型）
+  dxf_layers          创建/更新/重命名/删除图层（名称、颜色、线型）
   dxf_read            检查图纸（DXF 直读 / DWG 经 LibreDWG 转读）：实体统计、
                       类型分布、包围盒、图层列表
+  dxf_query           查找实体（按类型/图层/handle/文字），返回 handle + 摘要
+  dxf_delete          删除实体（handle/类型/图层；删标注时清理其 *D 图形块）
+  dxf_modify          修改实体属性（图层/颜色/线型/文字）与变换（移动/旋转/缩放）
+  dxf_restore         从自动滚动备份（.bak1~.bak5）恢复文件
+                      所有修改类工具在落盘前自动滚动备份
   dxf_render          渲染 PNG 预览（ezdxf + matplotlib，无需打开 CAD）
   dxf_export_pdf      导出矢量 PDF（matplotlib 矢量后端，可 A4 版面）
   dxf_convert_dwg     转换 DXF → DWG（LibreDWG dxf2dwg，纯本地）
@@ -62,6 +67,7 @@ _register_cjk_fonts()
 import matplotlib.pyplot as plt
 from ezdxf import bbox
 from ezdxf.addons.drawing import Frontend, RenderContext
+from ezdxf.math import Matrix44
 from ezdxf.addons.drawing.config import BackgroundPolicy, Configuration
 from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
 
@@ -248,7 +254,10 @@ def dxf_draw(path: str, entities: list[dict], dxfversion: str = "R2010") -> dict
             if not isinstance(spec, dict):
                 raise ValueError(f"实体 #{i} 不是对象: {spec!r}")
             added.append(_add_entity(msp, spec))
-        doc.saveas(str(_resolve(path)))
+        p = _resolve(path)
+        if not created:
+            _backup_file(p)
+        doc.saveas(str(p))
         return _ok(
             path=str(_resolve(path)),
             created_new=created,
@@ -398,7 +407,10 @@ def dxf_dimensions(path: str, dims: list[dict], dxfversion: str = "R2010") -> di
                 raise ValueError(f"标注 #{i} 不是对象: {spec!r}")
             t, value = _add_dimension(msp, spec)
             results.append({"type": t, "measurement": round(value, 6) if value is not None else None})
-        doc.saveas(str(_resolve(path)))
+        p = _resolve(path)
+        if not created:
+            _backup_file(p)
+        doc.saveas(str(p))
         return _ok(path=str(_resolve(path)), created_new=created, added=results,
                    added_count=len(results))
     except Exception as e:  # noqa: BLE001
@@ -455,7 +467,10 @@ def dxf_hatch(path: str, hatches: list[dict], dxfversion: str = "R2010") -> dict
             if note:
                 entry["note"] = note
             added.append(entry)
-        doc.saveas(str(_resolve(path)))
+        p = _resolve(path)
+        if not created:
+            _backup_file(p)
+        doc.saveas(str(p))
         return _ok(path=str(_resolve(path)), created_new=created, added=added,
                    added_count=len(added))
     except Exception as e:  # noqa: BLE001
@@ -490,7 +505,10 @@ def dxf_splines(path: str, splines: list[dict], dxfversion: str = "R2010") -> di
             attrs = _entity_attrs(spec)
             msp.add_spline(fit_points=pts, degree=degree, dxfattribs=attrs)
             added.append({"fit_points": len(pts), "degree": degree})
-        doc.saveas(str(_resolve(path)))
+        p = _resolve(path)
+        if not created:
+            _backup_file(p)
+        doc.saveas(str(p))
         return _ok(path=str(_resolve(path)), created_new=created, added=added,
                    added_count=len(added))
     except Exception as e:  # noqa: BLE001
@@ -547,7 +565,10 @@ def dxf_blocks(path: str, blocks: list[dict] | None = None, refs: list[dict] | N
                 attrs["yscale"] = float(spec["y_scale"])
             msp.add_blockref(name, insert=tuple(spec["insert"]), dxfattribs=attrs)
             inserted.append(name)
-        doc.saveas(str(_resolve(path)))
+        p = _resolve(path)
+        if not created:
+            _backup_file(p)
+        doc.saveas(str(p))
         return _ok(path=str(_resolve(path)), created_new=created,
                    blocks_made=made, refs_inserted=inserted)
     except Exception as e:  # noqa: BLE001
@@ -556,16 +577,58 @@ def dxf_blocks(path: str, blocks: list[dict] | None = None, refs: list[dict] | N
 
 @mcp.tool()
 def dxf_layers(path: str, layers: list[dict]) -> dict:
-    """创建或更新图层。
+    """创建/更新/重命名/删除图层（修改前自动滚动备份，dxf_restore 可回滚）。
 
-    每个图层: {name(必填), color(可选, 同 color 规则), linetype(可选,
-    如 "Continuous"/"Dashed"/"Center"/"Hidden")}. 文件不存在时先创建。
+    每个图层:
+      {name(必填), color(可选, 同 color 规则), linetype(可选,
+       如 "Continuous"/"Dashed"/"Center"/"Hidden")}            → 创建/更新
+      {name(必填), rename_to: "新名"}                          → 重命名
+      {name(必填), delete: true}                               → 删除
+       （非空图层会被保护性拒绝，返回该图层上的实体数提示）
+    文件不存在时先创建。
     """
     try:
         doc, created = _load_or_create(path)
         result = []
         for spec in layers:
             name = str(spec["name"])
+            if spec.get("delete"):
+                if name not in doc.layers:
+                    return _err(f"图层 {name} 不存在，无法删除")
+                # ezdxf 的 remove() 不检查实体引用，自己数（含图块内实体，
+                # *Model_Space 与 modelspace 同一空间需排除以免重复计数），
+                # 非空则拒绝，避免生成引用不存在图层的坏文件
+                count = sum(
+                    1
+                    for blk in ([doc.modelspace()]
+                                + [b for b in doc.blocks
+                                   if b.name != "*Model_Space"])
+                    for e in blk if e.dxf.layer == name
+                )
+                if count:
+                    return _err(f"图层 {name} 不能删除：上面还有 {count} 个实体"
+                                f"（先用 dxf_modify 移到别的图层，或 dxf_delete 删除）")
+                doc.layers.remove(name)
+                result.append(f"deleted:{name}")
+                continue
+            if spec.get("rename_to"):
+                if name not in doc.layers:
+                    return _err(f"图层 {name} 不存在，无法重命名")
+                new_name = str(spec["rename_to"])
+                if new_name in doc.layers:
+                    return _err(f"目标图层 {new_name} 已存在")
+                # 关键：ezdxf 没有图层改名 API，只改 group 2 会留下
+                # "实体仍引用旧图层名"的坏文件。必须先把所有引用旧名的
+                # 实体（模型空间 + 图块内）改指新名，再改图层条目名。
+                for blk in ([doc.modelspace()]
+                            + [b for b in doc.blocks
+                               if b.name != "*Model_Space"]):
+                    for e in blk:
+                        if e.dxf.layer == name:
+                            e.dxf.layer = new_name
+                doc.layers.get(name).dxf.name = new_name
+                result.append(f"renamed:{name}->{new_name}")
+                continue
             if name not in doc.layers:
                 doc.layers.add(name)
             layer = doc.layers.get(name)
@@ -582,8 +645,300 @@ def dxf_layers(path: str, layers: list[dict]) -> dict:
                     doc.linetypes.add(lt, pattern)
                 layer.linetype = lt
             result.append(name)
-        doc.saveas(str(_resolve(path)))
-        return _ok(path=str(_resolve(path)), created_new=created, layers=result)
+        p = _resolve(path)
+        if not created:
+            _backup_file(p)
+        doc.saveas(str(p))
+        return _ok(path=str(p), created_new=created, layers=result,
+                   backup=".bak1（dxf_restore 可回滚）")
+    except Exception as e:  # noqa: BLE001
+        return _err(f"{type(e).__name__}: {e}")
+
+
+# ── 编辑类工具（查询 / 删除 / 修改 / 备份恢复）────────────────────────────
+#
+# 解决 append-only 痛点：agent 画图是试错过程，需要"定位→改/删→回滚"闭环。
+# 所有修改类工具落盘前自动滚动备份（.bak1 最新 ~ .bak5 最旧）。
+
+BACKUP_MAX = 5
+
+
+def _backup_file(p: Path) -> None:
+    """滚动备份：.bakN → .bakN+1 后移，当前文件 → .bak1。
+    调用方必须在内存文档已加载、且随后会用 saveas 重新落盘时调用。"""
+    for i in range(BACKUP_MAX - 1, 0, -1):
+        src = p.with_name(p.name + f".bak{i}")
+        if src.exists():
+            src.replace(p.with_name(p.name + f".bak{i + 1}"))
+    p.replace(p.with_name(p.name + ".bak1"))
+
+
+def _match_entities(msp, types=None, layer=None, handles=None) -> list:
+    """按条件匹配模型空间实体。handles 给出时只做精确匹配（忽略 types/layer）；
+    否则按 types（大写归一）/layer 过滤，条件可缺省。"""
+    types_up = {str(t).upper() for t in types} if types else None
+    handles_set = {str(h) for h in handles} if handles else None
+    out = []
+    for e in msp:
+        if handles_set is not None:
+            if e.dxf.handle not in handles_set:
+                continue
+        else:
+            if types_up and e.dxftype() not in types_up:
+                continue
+            if layer is not None and e.dxf.layer != layer:
+                continue
+        out.append(e)
+    return out
+
+
+def _entity_summary(e) -> dict:
+    """实体一句话摘要（供 dxf_query 返回，帮 agent 判断改哪个）。"""
+    t = e.dxftype()
+    try:
+        if t == "LINE":
+            return {"start": list(e.dxf.start), "end": list(e.dxf.end)}
+        if t == "CIRCLE":
+            return {"center": list(e.dxf.center), "radius": e.dxf.radius}
+        if t == "ARC":
+            return {"center": list(e.dxf.center), "radius": e.dxf.radius,
+                    "start_angle": e.dxf.start_angle, "end_angle": e.dxf.end_angle}
+        if t in ("TEXT", "MTEXT"):
+            return {"text": str(e.dxf.text)[:50]}
+        if t == "LWPOLYLINE":
+            return {"points": len(list(e.get_points())), "closed": e.closed}
+        if t == "DIMENSION":
+            return {"dimtype": e.dxf.dimtype}
+        if t == "HATCH":
+            return {"pattern": e.dxf.pattern_name if e.dxf.pattern else "solid"}
+        if t == "INSERT":
+            return {"block": e.dxf.name, "insert": list(e.dxf.insert)}
+    except Exception:  # noqa: BLE001
+        pass
+    return {}
+
+
+@mcp.tool()
+def dxf_query(
+    path: str,
+    types: list[str] | None = None,
+    layer: str | None = None,
+    handles: list[str] | None = None,
+    text_contains: str | None = None,
+    limit: int = 100,
+) -> dict:
+    """查找图纸中的实体，返回 handle + 类型 + 图层 + 简要信息。
+    所有编辑工具（dxf_delete / dxf_modify）的前置步骤：先用它定位目标。
+
+    Args:
+        path: DXF 文件。
+        types: 类型过滤，如 ["LINE","CIRCLE","TEXT"]（大小写不敏感）
+        layer: 图层名过滤
+        handles: 精确 handle 列表（给出时忽略 types/layer）
+        text_contains: 按文字子串匹配 TEXT/MTEXT
+        limit: 最多返回条数（默认 100）
+    """
+    try:
+        p = _resolve(path)
+        if not p.exists():
+            return _err(f"文件不存在: {p}")
+        doc = ezdxf.readfile(str(p))
+        msp = doc.modelspace()
+        ents = _match_entities(msp, types, layer, handles)
+        if text_contains is not None:
+            tc = str(text_contains)
+            ents = [e for e in ents
+                    if e.dxftype() in ("TEXT", "MTEXT") and tc in str(e.dxf.text)]
+        total = len(ents)
+        out = []
+        for e in ents[:max(0, int(limit))]:
+            out.append({"handle": e.dxf.handle, "type": e.dxftype(),
+                        "layer": e.dxf.layer, "summary": _entity_summary(e)})
+        return _ok(path=str(p), matched=total, returned=len(out),
+                   truncated=total > len(out), entities=out)
+    except Exception as e:  # noqa: BLE001
+        return _err(f"{type(e).__name__}: {e}")
+
+
+@mcp.tool()
+def dxf_delete(
+    path: str,
+    handles: list[str] | None = None,
+    types: list[str] | None = None,
+    layer: str | None = None,
+) -> dict:
+    """删除实体（删除前自动滚动备份，dxf_restore 可回滚）。
+
+    Args:
+        path: DXF 文件。
+        handles: 精确 handle 列表（最高优先；给出时忽略 types/layer）
+        types: 按类型删除，如 ["TEXT","DIMENSION"]
+        layer: 删除某图层上的全部实体
+    三者至少给一个（不允许整图删除）。
+    注意：删除 DIMENSION 时同步清空其缓存图形块（*D），不留孤儿图形；
+    Defpoints 层中的定义点不动（不可见、无害）。
+    """
+    try:
+        if not (handles or types or layer):
+            return _err("handles / types / layer 至少给一个（不允许整图删除）")
+        p = _resolve(path)
+        if not p.exists():
+            return _err(f"文件不存在: {p}")
+        doc = ezdxf.readfile(str(p))
+        msp = doc.modelspace()
+        targets = _match_entities(msp, types, layer, handles)
+        if not targets:
+            return _err("没有匹配的实体（检查 handle/类型/图层拼写）")
+        by_type: dict[str, int] = {}
+        for e in targets:
+            if e.dxftype() == "DIMENSION":
+                geo = getattr(e.dxf, "geometry", None)
+                if geo:
+                    try:
+                        doc.blocks.get(geo).delete_all_entities()
+                    except Exception:  # noqa: BLE001
+                        pass
+            msp.delete_entity(e)
+            by_type[e.dxftype()] = by_type.get(e.dxftype(), 0) + 1
+        _backup_file(p)
+        doc.saveas(str(p))
+        return _ok(path=str(p), deleted=len(targets), by_type=by_type,
+                   backup=".bak1（dxf_restore 可回滚）")
+    except Exception as e:  # noqa: BLE001
+        return _err(f"{type(e).__name__}: {e}")
+
+
+@mcp.tool()
+def dxf_modify(
+    path: str,
+    handles: list[str],
+    layer: str | None = None,
+    color=None,
+    linetype: str | None = None,
+    text: str | None = None,
+    move: list[float] | None = None,
+    rotate_deg: float | None = None,
+    rotate_about: list[float] | None = None,
+    scale: float | None = None,
+    scale_about: list[float] | None = None,
+) -> dict:
+    """修改实体（修改前自动滚动备份，dxf_restore 可回滚）。
+
+    Args:
+        path: DXF 文件。
+        handles: 目标 handle 列表（必填，用 dxf_query 获取）。
+        layer: 移到图层（不存在会自动创建）
+        color: 新颜色（ACI 数字 / 颜色名 / #RRGGBB）
+        linetype: 新线型（Continuous/Dashed/Center/Hidden/Phantom/Dashdot）
+        text: 替换文字内容（仅 TEXT/MTEXT 有效）
+        move: [dx, dy] 平移
+        rotate_deg: 旋转角度（度，逆时针为正）
+        rotate_about: 旋转中心 [x, y]，默认 [0, 0]
+        scale: 均匀缩放倍数
+        scale_about: 缩放中心 [x, y]，默认 [0, 0]
+    变换按 move → rotate → scale 顺序应用。
+    """
+    try:
+        if not handles:
+            return _err("handles 必填（用 dxf_query 获取）")
+        p = _resolve(path)
+        if not p.exists():
+            return _err(f"文件不存在: {p}")
+        doc = ezdxf.readfile(str(p))
+        msp = doc.modelspace()
+        targets = _match_entities(msp, handles=handles)
+        if not targets:
+            return _err(f"没有匹配的实体（handles={list(handles)[:5]}...）")
+        applied: list[str] = []
+        if layer is not None:
+            lname = str(layer)
+            if lname not in doc.layers:
+                doc.layers.add(lname)
+            for e in targets:
+                e.dxf.layer = lname
+            applied.append(f"layer={lname}")
+        if color is not None:
+            ca = _color_attr(color)
+            if "color" in ca:
+                for e in targets:
+                    e.dxf.color = ca["color"]
+                applied.append(f"color={color}")
+        if linetype:
+            lt = str(linetype)
+            if lt not in doc.linetypes:
+                pattern = STANDARD_LINETYPE_PATTERNS.get(lt.upper())
+                if pattern is None:
+                    return _err(f"线型 {lt} 不存在且无内置 pattern 定义")
+                doc.linetypes.add(lt, pattern)
+            for e in targets:
+                e.dxf.linetype = lt
+            applied.append(f"linetype={lt}")
+        if text is not None:
+            bad = {e.dxftype() for e in targets
+                   if e.dxftype() not in ("TEXT", "MTEXT")}
+            if bad:
+                return _err(f"text 仅对 TEXT/MTEXT 有效，目标含 {sorted(bad)}")
+            for e in targets:
+                e.dxf.text = str(text)
+            applied.append(f"text={str(text)[:30]!r}")
+        # 变换：A*B = 先 A 后 B；绕点 = T(-c) * M * T(c)
+        m: Matrix44 | None = None
+        if move:
+            dx, dy = float(move[0]), float(move[1])
+            m = Matrix44.translate(dx, dy, 0)
+            applied.append(f"move=({dx:g},{dy:g})")
+        if rotate_deg is not None:
+            c = rotate_about or [0, 0]
+            mr = (Matrix44.translate(-float(c[0]), -float(c[1]), 0)
+                  * Matrix44.z_rotate(math.radians(float(rotate_deg)))
+                  * Matrix44.translate(float(c[0]), float(c[1]), 0))
+            m = mr if m is None else m * mr
+            applied.append(f"rotate={rotate_deg:g}deg@({c[0]:g},{c[1]:g})")
+        if scale is not None:
+            c = scale_about or [0, 0]
+            s = float(scale)
+            ms = (Matrix44.translate(-float(c[0]), -float(c[1]), 0)
+                  * Matrix44.scale(s, s, 1)
+                  * Matrix44.translate(float(c[0]), float(c[1]), 0))
+            m = ms if m is None else m * ms
+            applied.append(f"scale={s:g}@({c[0]:g},{c[1]:g})")
+        if m is not None:
+            for e in targets:
+                e.transform(m)
+        if not applied:
+            return _err("没有给出任何修改参数"
+                        "（layer/color/linetype/text/move/rotate_deg/scale 至少一项）")
+        _backup_file(p)
+        doc.saveas(str(p))
+        return _ok(path=str(p), modified=len(targets), applied=applied,
+                   backup=".bak1（dxf_restore 可回滚）")
+    except Exception as e:  # noqa: BLE001
+        return _err(f"{type(e).__name__}: {e}")
+
+
+@mcp.tool()
+def dxf_restore(path: str, slot: int = 1) -> dict:
+    """把文件恢复到某份自动备份（修改类工具落盘前自动滚动备份）。
+
+    Args:
+        path: DXF 文件。
+        slot: 备份槽位 1~5，1 = 最近一次修改前的状态（默认），5 = 最旧。
+    """
+    try:
+        p = _resolve(path)
+        if not p.exists():
+            return _err(f"文件不存在: {p}")
+        slot = int(slot)
+        if not 1 <= slot <= BACKUP_MAX:
+            return _err(f"slot 需在 1~{BACKUP_MAX} 之间")
+        bak = p.with_name(p.name + f".bak{slot}")
+        if not bak.exists():
+            avail = [i for i in range(1, BACKUP_MAX + 1)
+                     if p.with_name(p.name + f".bak{i}").exists()]
+            return _err(f"备份 .bak{slot} 不存在；可用槽位: {avail or '无（还没有备份）'}")
+        bak.replace(p)
+        return _ok(path=str(p), restored_from=bak.name, slot=slot,
+                   size_bytes=p.stat().st_size)
     except Exception as e:  # noqa: BLE001
         return _err(f"{type(e).__name__}: {e}")
 
