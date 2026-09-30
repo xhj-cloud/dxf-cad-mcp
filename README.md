@@ -10,6 +10,7 @@
 
 - **跨平台**：macOS / Windows / Linux 均可运行（DXF 是 Autodesk 公开规范的交换格式）
 - **纯本地**：ezdxf + matplotlib，不需要网络，不需要 CAD 授权即可生成图纸
+- **DWG 输出**：`dxf_convert_dwg` 一键 DXF→DWG（LibreDWG，DWG 是专有格式，ezdxf 写不了）
 - **macOS + AutoCAD 友好**：内置中文字体（.ttc）与 "白/黑" 双色（ACI 7）渲染修复
 
 ## 为什么走 DXF 路线
@@ -22,7 +23,7 @@
 
 ## 特性
 
-- 11 个 MCP 工具，覆盖完整 2D 绘图工作流（见下表）
+- 12 个 MCP 工具，覆盖完整 2D 绘图工作流（见下表）
 - 9 种基础实体 + 5 种尺寸标注 + 27 种标准填充图案 + 样条 + 图块
 - 颜色三种写法：ACI 数字 / 颜色名（`"red"`）/ `#RRGGBB` 真彩色
 - 内置标准线型：Dashed / Center / Hidden / Phantom / Dashdot
@@ -43,6 +44,7 @@
 | `dxf_read` | 检查图纸：版本、实体统计、类型分布、包围盒、图层 |
 | `dxf_render` | 渲染 PNG 预览（ezdxf + matplotlib，不需要打开 CAD） |
 | `dxf_export_pdf` | 导出矢量 PDF（线条/文字保持矢量，可 auto 自适应或 A4/A3/A2 横版） |
+| `dxf_convert_dwg` | DXF → DWG 转换（LibreDWG dxf2dwg，纯本地；版本 r12/r14/r2000/r2004，默认 r2000） |
 | `dxf_open_in_autocad` | 用 macOS `open` 打开到本机 AutoCAD（自动找 /Applications/Autodesk 下的实例，完整版优先） |
 
 ## 快速开始
@@ -52,6 +54,10 @@ git clone <repo-url> dxf-cad-mcp && cd dxf-cad-mcp
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt     # mcp<2, ezdxf, matplotlib
 ```
+
+> 可选：`dxf_convert_dwg` 依赖系统安装 **LibreDWG**（提供 `dxf2dwg` 命令）：
+> `brew install libredwg`（macOS）/ `apt install libredwg`（Debian/Ubuntu）。
+> 未安装时该工具返回安装提示，其余 11 个工具不受影响。
 
 或者直接作为包安装（附带 `dxf-cad-mcp` 命令）：
 
@@ -115,6 +121,9 @@ dsh（`~/.dsh/profiles/web/cordis.patch.yml`）：
   定义点重新渲染，**以 CAD 显示为准**）
 - 填充边界仅支持闭合多边形（圆形/弧线边界暂不支持）
 - 仅 model space；布局/图纸空间未实现
+- `dxf_convert_dwg` 走 LibreDWG 开源实现，成熟度低于 Autodesk 官方：MATERIAL /
+  MLEADERSTYLE 等专有对象自动跳过（不影响几何）；转换前会把 MTEXT 旋转角归零
+  （绕开 LibreDWG 解析 bug），AutoCAD 打开后标注文字按定义点重渲染，显示不受影响
 - `dxf_open_in_autocad` 仅 macOS（依赖 `open` 命令）
 - mcp SDK 固定 `<2`：2.x 把 FastMCP 改名 MCPServer，与 v1 客户端生态不兼容
 
@@ -122,7 +131,7 @@ dsh（`~/.dsh/profiles/web/cordis.patch.yml`）：
 
 ```
 dxf-cad-mcp/
-├── server.py            # MCP 服务器（11 个工具）
+├── server.py            # MCP 服务器（12 个工具）
 ├── examples/
 │   └── quickstart.py    # 直调示例（无需 MCP 协议）
 ├── test_client.py       # 端到端测试（第一批）

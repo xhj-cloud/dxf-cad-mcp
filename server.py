@@ -17,6 +17,7 @@ PNG 预览 → 一键打开到 AutoCAD」的完整流程。
   dxf_read            检查图纸：实体统计、类型分布、包围盒、图层列表
   dxf_render          渲染 PNG 预览（ezdxf + matplotlib，无需打开 CAD）
   dxf_export_pdf      导出矢量 PDF（matplotlib 矢量后端，可 A4 版面）
+  dxf_convert_dwg     转换 DXF → DWG（LibreDWG dxf2dwg，纯本地）
   dxf_open_in_autocad 用 macOS open 把文件打开到本机 AutoCAD
 
 依赖：mcp, ezdxf, matplotlib（venv 安装）。
@@ -27,7 +28,9 @@ from __future__ import annotations
 import glob
 import math
 import os
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import ezdxf
@@ -723,6 +726,121 @@ def dxf_export_pdf(
         plt.close(fig)
         return _ok(path=str(p), pdf=str(out), size_bytes=out.stat().st_size,
                    page_size=str(page_size).upper() if page_size != "auto" else "auto-fit")
+    except Exception as e:  # noqa: BLE001
+        return _err(f"{type(e).__name__}: {e}")
+
+
+# ── DXF → DWG 转换（LibreDWG）─────────────────────────────────────────────
+#
+# macOS 上可脚本化的 DXF→DWG 只有 LibreDWG（ODA File Converter 无 Mac 版，
+# ezdxf 只能读写 DXF，DWG 是 Autodesk 专有格式）。brew install libredwg。
+
+_DXF2DWG_VERSIONS = {
+    "r12": ("AC1006", "R12"),
+    "r14": ("AC1009", "R14"),
+    "r2000": ("AC1015", "R2000"),
+    "r2004": ("AC1018", "R2004"),
+}
+
+
+def _find_dxf2dwg() -> str | None:
+    """定位 dxf2dwg（LibreDWG）可执行文件。"""
+    found = shutil.which("dxf2dwg")
+    if found:
+        return found
+    for p in ("/opt/homebrew/bin/dxf2dwg", "/usr/local/bin/dxf2dwg",
+              "/usr/bin/dxf2dwg"):
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _normalize_mtext_for_libredwg(src: Path, dst: Path) -> int:
+    """LibreDWG 0.14 读取器 bug：无法解析 MTEXT 的 group code 50（旋转角），
+    直接报 'Invalid DXF code 50 for MTEXT' 使整个转换失败（实测复现）。
+    转换前把全部 MTEXT（模型空间 + 所有图块，含标注的缓存图形表示）的
+    旋转角归零另存临时副本，源文件不动。返回被修改的 MTEXT 数量。
+
+    显示不受影响：MTEXT 只是 DIMENSION 的缓存渲染，AutoCAD 打开 DWG 后
+    会按标注定义点与 dimstyle 重新渲染，竖直标注文字自动恢复 90° 方向。
+    """
+    doc = ezdxf.readfile(str(src))
+    fixed = 0
+    for blk in [doc.modelspace()] + list(doc.blocks):
+        for e in blk:
+            if e.dxftype() == "MTEXT" and e.dxf.rotation != 0:
+                e.dxf.rotation = 0
+                fixed += 1
+    doc.saveas(str(dst))
+    return fixed
+
+
+@mcp.tool()
+def dxf_convert_dwg(
+    path: str,
+    output_path: str | None = None,
+    version: str = "r2000",
+    overwrite: bool = True,
+) -> dict:
+    """把 DXF 转换为 DWG（LibreDWG dxf2dwg，纯本地，不需要 AutoCAD）。
+
+    Args:
+        path: 源 DXF 文件。
+        output_path: 输出 DWG 路径，默认与源文件同名改 .dwg 后缀。
+        version: 目标 DWG 版本 "r12"/"r14"/"r2000"/"r2004"（LibreDWG 支持上限
+            r2004），默认 r2000（AC1015，最成熟；AutoCAD 2024 均可打开）。
+        overwrite: 输出文件已存在时覆盖（默认 True）。
+
+    注意：
+        - 依赖系统安装 LibreDWG（macOS: `brew install libredwg`），
+          未安装时返回安装提示。
+        - LibreDWG 是开源实现，成熟度低于 Autodesk 官方：MATERIAL /
+          MLEADERSTYLE 等专有对象自动跳过（不影响几何）。
+        - 转换前会把 MTEXT 旋转角归零（绕开 LibreDWG 解析 bug，源 DXF 不变）；
+          AutoCAD 打开 DWG 后标注文字按定义点重新渲染，显示不受影响。
+    """
+    try:
+        p = _resolve(path)
+        if not p.exists():
+            return _err(f"文件不存在: {p}")
+        ver = str(version).lower()
+        if ver not in _DXF2DWG_VERSIONS:
+            return _err(
+                f"不支持的版本: {version}；可选: {', '.join(_DXF2DWG_VERSIONS)}")
+        exe = _find_dxf2dwg()
+        if exe is None:
+            return _err("未找到 dxf2dwg：转换依赖 LibreDWG，"
+                        "macOS 请先执行 `brew install libredwg`")
+        out = _resolve(output_path) if output_path else p.with_suffix(".dwg")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        if out.exists() and not overwrite:
+            return _err(f"输出文件已存在（overwrite=False）: {out}")
+
+        fixed = 0
+        with tempfile.TemporaryDirectory(prefix="dxf2dwg-") as td:
+            tmp = Path(td) / p.name
+            fixed = _normalize_mtext_for_libredwg(p, tmp)
+            cmd = [exe, "--as", ver, "-o", str(out), str(tmp)]
+            if overwrite:
+                cmd.append("-y")
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            detail = (r.stdout or "") + (r.stderr or "")
+        if r.returncode != 0 or not out.exists() or out.stat().st_size == 0:
+            return _err(f"转换失败 (exit {r.returncode}): "
+                        f"{detail.strip()[-500:]}")
+        magic = out.read_bytes()[:6].decode("ascii", "replace")
+        expected_magic, expected_name = _DXF2DWG_VERSIONS[ver]
+        return _ok(
+            path=str(p),
+            dwg=str(out),
+            size_bytes=out.stat().st_size,
+            dwg_version=expected_name if magic == expected_magic else magic,
+            mtext_rotation_fixed=fixed,
+            note="LibreDWG dxf2dwg 转换；MATERIAL 等专有对象已自动跳过，"
+                 "建议用 AutoCAD 打开确认终显（dxf_open_in_autocad）。",
+        )
+    except subprocess.TimeoutExpired:
+        return _err("转换超时（300s）：图纸可能过大")
     except Exception as e:  # noqa: BLE001
         return _err(f"{type(e).__name__}: {e}")
 
