@@ -14,7 +14,8 @@ PNG 预览 → 一键打开到 AutoCAD」的完整流程。
   dxf_splines         追加样条线（过给定点集的拟合样条，degree 2/3）
   dxf_blocks          定义图块（内含 dxf_draw 同款实体）并插入引用
   dxf_layers          创建/更新图层（名称、颜色、线型）
-  dxf_read            检查图纸：实体统计、类型分布、包围盒、图层列表
+  dxf_read            检查图纸（DXF 直读 / DWG 经 LibreDWG 转读）：实体统计、
+                      类型分布、包围盒、图层列表
   dxf_render          渲染 PNG 预览（ezdxf + matplotlib，无需打开 CAD）
   dxf_export_pdf      导出矢量 PDF（matplotlib 矢量后端，可 A4 版面）
   dxf_convert_dwg     转换 DXF → DWG（LibreDWG dxf2dwg，纯本地）
@@ -587,39 +588,126 @@ def dxf_layers(path: str, layers: list[dict]) -> dict:
         return _err(f"{type(e).__name__}: {e}")
 
 
+_DWG_MAGIC_VERSIONS = {
+    "AC1006": "R12",
+    "AC1009": "R13",
+    "AC1012": "R14",
+    "AC1015": "R2000",
+    "AC1018": "R2004",
+    "AC1021": "R2007",
+    "AC1024": "R2010",
+    "AC1027": "R2013",
+    "AC1032": "R2018",
+}
+
+
+def _find_libredwg_tool(name: str) -> str | None:
+    """定位 LibreDWG 命令行工具（dxf2dwg / dwg2dxf / ...）。"""
+    found = shutil.which(name)
+    if found:
+        return found
+    for prefix in ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"):
+        candidate = os.path.join(prefix, name)
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def _dwg_version(p: Path) -> str | None:
+    """从 DWG 文件头 magic（前 6 字节，如 AC1015）识别版本。"""
+    try:
+        with open(p, "rb") as f:
+            magic = f.read(6).decode("ascii", "replace")
+    except OSError:
+        return None
+    return _DWG_MAGIC_VERSIONS.get(magic)
+
+
+def _dwg_to_dxf(p: Path, tmpdir: Path) -> tuple[Path, str]:
+    """DWG → 临时 DXF（LibreDWG dwg2dxf）。返回 (临时 DXF 路径, 版本字符串)。
+
+    dwg2dxf 把输出写到当前工作目录（文件名 = 输入文件名改 .dxf），
+    所以把子进程 cwd 指到临时目录即可。
+    """
+    exe = _find_libredwg_tool("dwg2dxf")
+    if exe is None:
+        raise RuntimeError("未找到 dwg2dxf：读取 DWG 依赖 LibreDWG，"
+                           "macOS 请先执行 `brew install libredwg`")
+    r = subprocess.run([exe, str(p)], cwd=str(tmpdir), capture_output=True,
+                       text=True, timeout=300)
+    out = tmpdir / (p.stem + ".dxf")
+    if r.returncode != 0 or not out.exists():
+        detail = ((r.stdout or "") + (r.stderr or "")).strip()
+        raise RuntimeError(f"dwg2dxf 转换失败 (exit {r.returncode}): {detail[-500:]}")
+    return out, _dwg_version(p) or "unknown"
+
+
+def _dxf_stats(doc, p: Path) -> dict:
+    """DXF 文档的公共统计（dxf_read 的 DXF 直读与 DWG 转读共用）。"""
+    msp = doc.modelspace()
+    by_type: dict[str, int] = {}
+    total = 0
+    for e in msp:
+        total += 1
+        by_type[e.dxftype()] = by_type.get(e.dxftype(), 0) + 1
+    extents = None
+    if total:
+        try:
+            b = bbox.extents(msp)
+            extents = {
+                "min": [round(b.extmin.x, 4), round(b.extmin.y, 4)],
+                "max": [round(b.extmax.x, 4), round(b.extmax.y, 4)],
+            }
+        except Exception:  # noqa: BLE001
+            extents = None
+    return _ok(
+        path=str(p),
+        dxf_version=doc.dxfversion,
+        entity_count=total,
+        by_type=by_type,
+        extents=extents,
+        layers=[l.dxf.name for l in doc.layers],
+        size_bytes=p.stat().st_size,
+    )
+
+
 @mcp.tool()
 def dxf_read(path: str) -> dict:
-    """检查一张 DXF 图纸：DXF 版本、实体总数与类型分布、包围盒、图层列表。"""
+    """检查一张图纸，DXF / DWG 均支持：
+
+    - DXF：ezdxf 直接读取
+    - DWG：经 LibreDWG dwg2dxf 自动转临时 DXF 后读取（需
+      `brew install libredwg`，与 dxf_convert_dwg 同一依赖）
+
+    返回：格式、版本、实体总数与类型分布、包围盒、图层列表。
+    注意：DWG 走 LibreDWG 开源实现，MATERIAL 等专有对象会被跳过，
+    统计与 AutoCAD 显示可能有细微差异，终显以 AutoCAD 为准。
+    """
     try:
         p = _resolve(path)
         if not p.exists():
             return _err(f"文件不存在: {p}")
+        if p.suffix.lower() == ".dwg":
+            with tempfile.TemporaryDirectory(prefix="dwg2dxf-read-") as td:
+                tmp_dxf, version = _dwg_to_dxf(p, Path(td))
+                try:
+                    doc = ezdxf.readfile(str(tmp_dxf))
+                except Exception as e:  # noqa: BLE001
+                    raise RuntimeError(
+                        "DWG→DXF 转出后 ezdxf 解析失败（LibreDWG 对该 DWG "
+                        f"版本的转出不完整，如 0.14 的 r2004 往返 bug）: {e}") from e
+                stats = _dxf_stats(doc, p)
+            stats["source_format"] = "DWG"
+            stats["dwg_version"] = version
+            stats["note"] = ("LibreDWG dwg2dxf 转读；专有对象（MATERIAL 等）已跳过，"
+                             "终显以 AutoCAD 为准。")
+            return stats
         doc = ezdxf.readfile(str(p))
-        msp = doc.modelspace()
-        by_type: dict[str, int] = {}
-        total = 0
-        for e in msp:
-            total += 1
-            by_type[e.dxftype()] = by_type.get(e.dxftype(), 0) + 1
-        extents = None
-        if total:
-            try:
-                b = bbox.extents(msp)
-                extents = {
-                    "min": [round(b.extmin.x, 4), round(b.extmin.y, 4)],
-                    "max": [round(b.extmax.x, 4), round(b.extmax.y, 4)],
-                }
-            except Exception:  # noqa: BLE001
-                extents = None
-        return _ok(
-            path=str(p),
-            dxf_version=doc.dxfversion,
-            entity_count=total,
-            by_type=by_type,
-            extents=extents,
-            layers=[l.dxf.name for l in doc.layers],
-            size_bytes=p.stat().st_size,
-        )
+        stats = _dxf_stats(doc, p)
+        stats["source_format"] = "DXF"
+        return stats
+    except subprocess.TimeoutExpired:
+        return _err("DWG 读取超时（300s）：图纸可能过大")
     except Exception as e:  # noqa: BLE001
         return _err(f"{type(e).__name__}: {e}")
 
@@ -745,14 +833,7 @@ _DXF2DWG_VERSIONS = {
 
 def _find_dxf2dwg() -> str | None:
     """定位 dxf2dwg（LibreDWG）可执行文件。"""
-    found = shutil.which("dxf2dwg")
-    if found:
-        return found
-    for p in ("/opt/homebrew/bin/dxf2dwg", "/usr/local/bin/dxf2dwg",
-              "/usr/bin/dxf2dwg"):
-        if os.path.exists(p):
-            return p
-    return None
+    return _find_libredwg_tool("dxf2dwg")
 
 
 def _normalize_mtext_for_libredwg(src: Path, dst: Path) -> int:
@@ -789,11 +870,15 @@ def dxf_convert_dwg(
         output_path: 输出 DWG 路径，默认与源文件同名改 .dwg 后缀。
         version: 目标 DWG 版本 "r12"/"r14"/"r2000"/"r2004"（LibreDWG 支持上限
             r2004），默认 r2000（AC1015，最成熟；AutoCAD 2024 均可打开）。
+            注意：LibreDWG 0.14 的 r2004 读回不完整（回读验证会失败），
+            建议优先 r2000。
         overwrite: 输出文件已存在时覆盖（默认 True）。
 
     注意：
         - 依赖系统安装 LibreDWG（macOS: `brew install libredwg`），
           未安装时返回安装提示。
+        - 转换后自动回读验证（dwg2dxf → ezdxf 解析），verified=false 时
+          文件仍可能用 AutoCAD 打开，但建议换 r2000 重转。
         - LibreDWG 是开源实现，成熟度低于 Autodesk 官方：MATERIAL /
           MLEADERSTYLE 等专有对象自动跳过（不影响几何）。
         - 转换前会把 MTEXT 旋转角归零（绕开 LibreDWG 解析 bug，源 DXF 不变）；
@@ -830,14 +915,32 @@ def dxf_convert_dwg(
                         f"{detail.strip()[-500:]}")
         magic = out.read_bytes()[:6].decode("ascii", "replace")
         expected_magic, expected_name = _DXF2DWG_VERSIONS[ver]
+
+        # 回读验证：把刚写出的 DWG 再 dwg2dxf 转回并用 ezdxf 解析，
+        # 确认文件真的可读（能提前暴露 LibreDWG 某些版本的往返 bug）。
+        verified, verify_err = True, None
+        with tempfile.TemporaryDirectory(prefix="dwg2dwg-verify-") as vtd:
+            try:
+                v_dxf, _ = _dwg_to_dxf(out, Path(vtd))
+                ezdxf.readfile(str(v_dxf))
+            except Exception as ve:  # noqa: BLE001
+                verified = False
+                verify_err = f"{type(ve).__name__}: {str(ve)[:200]}"
+
+        note = ("LibreDWG dxf2dwg 转换；MATERIAL 等专有对象已自动跳过，"
+                "建议用 AutoCAD 打开确认终显（dxf_open_in_autocad）。")
+        if not verified:
+            note = ("⚠ 回读验证失败（LibreDWG 往返不完整）："
+                    f"{verify_err}。文件仍可能用 AutoCAD 打开，"
+                    "但建议换 version='r2000' 重转。")
         return _ok(
             path=str(p),
             dwg=str(out),
             size_bytes=out.stat().st_size,
             dwg_version=expected_name if magic == expected_magic else magic,
             mtext_rotation_fixed=fixed,
-            note="LibreDWG dxf2dwg 转换；MATERIAL 等专有对象已自动跳过，"
-                 "建议用 AutoCAD 打开确认终显（dxf_open_in_autocad）。",
+            verified=verified,
+            note=note,
         )
     except subprocess.TimeoutExpired:
         return _err("转换超时（300s）：图纸可能过大")

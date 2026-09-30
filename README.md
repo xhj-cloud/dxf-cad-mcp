@@ -41,7 +41,7 @@
 | `dxf_splines` | 追加样条线（过拟合点集的 2/3 阶样条） |
 | `dxf_blocks` | 定义图块（内含 `dxf_draw` 同款实体）并插入引用（旋转/缩放） |
 | `dxf_layers` | 创建/更新图层（颜色：ACI 数字 / 颜色名 / #RRGGBB；线型：Continuous/Dashed/Center/Hidden/Phantom/Dashdot） |
-| `dxf_read` | 检查图纸：版本、实体统计、类型分布、包围盒、图层 |
+| `dxf_read` | 检查图纸（**DXF / DWG 均支持**）：版本、实体统计、类型分布、包围盒、图层；DWG 经 LibreDWG 自动转读 |
 | `dxf_render` | 渲染 PNG 预览（ezdxf + matplotlib，不需要打开 CAD） |
 | `dxf_export_pdf` | 导出矢量 PDF（线条/文字保持矢量，可 auto 自适应或 A4/A3/A2 横版） |
 | `dxf_convert_dwg` | DXF → DWG 转换（LibreDWG dxf2dwg，纯本地；版本 r12/r14/r2000/r2004，默认 r2000） |
@@ -121,9 +121,13 @@ dsh（`~/.dsh/profiles/web/cordis.patch.yml`）：
   定义点重新渲染，**以 CAD 显示为准**）
 - 填充边界仅支持闭合多边形（圆形/弧线边界暂不支持）
 - 仅 model space；布局/图纸空间未实现
-- `dxf_convert_dwg` 走 LibreDWG 开源实现，成熟度低于 Autodesk 官方：MATERIAL /
-  MLEADERSTYLE 等专有对象自动跳过（不影响几何）；转换前会把 MTEXT 旋转角归零
-  （绕开 LibreDWG 解析 bug），AutoCAD 打开后标注文字按定义点重渲染，显示不受影响
+- `dxf_convert_dwg` / DWG 读取走 LibreDWG 开源实现，成熟度低于 Autodesk 官方：
+  MATERIAL / MLEADERSTYLE 等专有对象自动跳过（不影响几何）；转换前会把 MTEXT
+  旋转角归零（绕开 LibreDWG 解析 bug），AutoCAD 打开后标注文字按定义点重渲染，
+  显示不受影响
+- LibreDWG 0.14 的 **r2004 往返不完整**（转出 DXF 缺 EOF，读回即失败）：
+  `dxf_convert_dwg` 会回读验证并标 `verified=false`，`dxf_read` 返回明确错误；
+  DWG 转换/读取建议用 r2000
 - `dxf_open_in_autocad` 仅 macOS（依赖 `open` 命令）
 - mcp SDK 固定 `<2`：2.x 把 FastMCP 改名 MCPServer，与 v1 客户端生态不兼容
 
