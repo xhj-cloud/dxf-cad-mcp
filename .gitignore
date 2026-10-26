@@ -24,3 +24,8 @@ examples/*.pdf
 .idea/
 .vscode/
 *.swp
+
+# 调试日志
+stderr.log
+stdout.log
+*.log

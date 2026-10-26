@@ -40,15 +40,18 @@ import tempfile
 from pathlib import Path
 
 import ezdxf
-import matplotlib
+from ezdxf import bbox
+from ezdxf.math import Matrix44
 
-matplotlib.use("Agg")  # 无显示环境渲染
+from mcp.server.fastmcp import FastMCP
 
 
 def _register_cjk_fonts() -> None:
     """matplotlib 默认不注册 macOS 的 .ttc 字体集合，不注册时 DXF 里的中文
-    在 PNG 预览中渲染为空白（AutoCAD 端不受影响）。启动时静默注册系统 CJK 字体。"""
+    在 PNG 预览中渲染为空白（AutoCAD 端不受影响）。静默注册系统 CJK 字体。"""
     import glob as _glob
+
+    import matplotlib
 
     for pattern in (
         "/System/Library/Fonts/PingFang.ttc",
@@ -63,15 +66,38 @@ def _register_cjk_fonts() -> None:
                 pass
 
 
-_register_cjk_fonts()
-import matplotlib.pyplot as plt
-from ezdxf import bbox
-from ezdxf.addons.drawing import Frontend, RenderContext
-from ezdxf.math import Matrix44
-from ezdxf.addons.drawing.config import BackgroundPolicy, Configuration
-from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
+_MPL: dict | None = None
 
-from mcp.server.fastmcp import FastMCP
+
+def _mpl() -> dict:
+    """懒加载 matplotlib 与 ezdxf 绘图后端（仅 dxf_render / dxf_export_pdf 需要）。
+
+    为什么必须懒加载：matplotlib 首次导入要扫描系统字体并（缓存缺失时）重建
+    字体缓存，冷启动可达 8~9 秒。MCP 客户端在 initialize 之后要等 tools/list
+    返回才拿到本服务器的工具表——如果这 9 秒卡在模块导入期，客户端建立会话时
+    的工具清单就可能只捕获到「本服务器尚未注册」的状态，导致这些工具在整轮
+    会话里对模型不可见。延迟到真正渲染时再导入，可让握手在 1 秒内完成。
+    """
+    global _MPL
+    if _MPL is None:
+        import matplotlib
+
+        matplotlib.use("Agg")  # 无显示环境渲染
+        _register_cjk_fonts()
+        import matplotlib.pyplot as plt
+        from ezdxf.addons.drawing import Frontend, RenderContext
+        from ezdxf.addons.drawing.config import BackgroundPolicy, Configuration
+        from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
+
+        _MPL = {
+            "plt": plt,
+            "Frontend": Frontend,
+            "RenderContext": RenderContext,
+            "BackgroundPolicy": BackgroundPolicy,
+            "Configuration": Configuration,
+            "MatplotlibBackend": MatplotlibBackend,
+        }
+    return _MPL
 
 mcp = FastMCP("dxf-cad")
 
@@ -129,7 +155,19 @@ def _entity_attrs(spec: dict) -> dict:
     if spec.get("layer"):
         attrs["layer"] = str(spec["layer"])
     attrs.update(_color_attr(spec.get("color")))
+    if spec.get("lineweight") is not None:
+        attrs["lineweight"] = _lineweight(int(spec["lineweight"]))
     return attrs
+
+
+def _lineweight(v: int) -> int:
+    """线宽归一（单位 1/100 mm）。支持标准值 0/5/9/13/15/18/20/25/30/35/40/50/
+    53/60/70/80/90/100/106/120/140/158/200/211；非标准值就近取标准档。"""
+    std = (0, 5, 9, 13, 15, 18, 20, 25, 30, 35, 40, 50, 53, 60, 70, 80,
+           90, 100, 106, 120, 140, 158, 200, 211)
+    if v in std:
+        return v
+    return min(std, key=lambda s: abs(s - v))
 
 
 def _add_entity(msp, spec: dict) -> str:
@@ -180,6 +218,8 @@ def _add_entity(msp, spec: dict) -> str:
         ta["insert"] = spec["point"]
         ta["height"] = float(spec.get("height", 2.5))
         ta["rotation"] = float(spec.get("rotation", 0))
+        if spec.get("style"):
+            ta["style"] = str(spec["style"])
         msp.add_text(spec["text"], dxfattribs=ta)
     elif t == "mtext":
         ta = dict(attrs)
@@ -187,6 +227,8 @@ def _add_entity(msp, spec: dict) -> str:
         ta["char_height"] = float(spec.get("char_height", 2.5))
         if spec.get("width"):
             ta["width"] = float(spec["width"])
+        if spec.get("style"):
+            ta["style"] = str(spec["style"])
         msp.add_mtext(spec["text"], dxfattribs=ta)
     else:
         raise ValueError(f"未知实体类型: {t!r}")
@@ -229,7 +271,9 @@ def dxf_draw(path: str, entities: list[dict], dxfversion: str = "R2010") -> dict
     """向 DXF 图纸追加 2D 实体；文件不存在时自动创建。
 
     每个实体是一个 dict，公共可选字段：layer（图层名，默认 0）、
-    color（ACI 数字 / 颜色名如 "red" / "#RRGGBB"）。
+    color（ACI 数字 / 颜色名如 "red" / "#RRGGBB"）、
+    lineweight（线宽，单位 1/100mm，如 50=0.5mm 粗实线 / 25=0.25mm /
+    13=0.13mm 细线；不传则跟随图层）。
 
     实体类型与必填字段：
       line:      start, end
@@ -239,8 +283,9 @@ def dxf_draw(path: str, entities: list[dict], dxfversion: str = "R2010") -> dict
       arc:       center[x,y], radius, start_angle, end_angle(度, 逆时针)
       ellipse:   center[x,y], major_radius, ratio(0~1), rotation(度, 可选)
       point:     point[x,y]
-      text:      point[x,y], text, height, rotation(度, 可选)
-      mtext:     point[x,y], text, char_height, width(可选)
+      text:      point[x,y], text, height, rotation(度, 可选), style(文字样式, 可选)
+      mtext:     point[x,y], text, char_height, width(可选), style(文字样式, 可选)
+      style 需先用 dxf_styles 创建（中文文字必须挂中文样式，否则 CAD 乱码）
     """
     try:
         doc, created = _load_or_create(path, dxfversion)
@@ -582,6 +627,8 @@ def dxf_layers(path: str, layers: list[dict]) -> dict:
     每个图层:
       {name(必填), color(可选, 同 color 规则), linetype(可选,
        如 "Continuous"/"Dashed"/"Center"/"Hidden"),
+       lineweight(可选 int, 单位 1/100mm，如 50=0.5mm 粗实线 /
+       25=0.25mm / 13=0.13mm 细线；AutoCAD 需开"线宽显示"才可见),
        on(可选 bool), frozen(可选 bool), locked(可选 bool)}     → 创建/更新
       {name(必填), rename_to: "新名"}                           → 重命名
       {name(必填), delete: true}                                → 删除
@@ -647,6 +694,11 @@ def dxf_layers(path: str, layers: list[dict]) -> dict:
                         raise ValueError(f"线型 {lt} 不存在且无内置 pattern 定义")
                     doc.linetypes.add(lt, pattern)
                 layer.linetype = lt
+            if spec.get("lineweight") is not None:
+                # 注意: 必须写 layer.dxf.lineweight（group 370）。
+                # layer.lineweight 是 ezdxf 只读便捷属性，直接赋值会变成
+                # 实例属性影子、dxf 值不变（静默失败）。
+                layer.dxf.lineweight = _lineweight(int(spec["lineweight"]))
             # 图层状态（ezdxf 的编码：off = 颜色取负号；frozen/locked = group 70 位）。
             # 先设颜色再开关，off 会把颜色变负——所以 on/off 必须放在 color 之后。
             if spec.get("on") is not None:
@@ -727,6 +779,81 @@ def _entity_summary(e) -> dict:
     except Exception:  # noqa: BLE001
         pass
     return {}
+
+
+STYLE_PRESETS = {
+    "宋体": ("simsun.ttc", ""),
+    "黑体": ("simhei.ttf", ""),
+    "楷体": ("simkai.ttf", ""),
+    "仿宋": ("simfang.ttf", ""),
+    "gbcbig": ("gbenor.shx", "gbcbig.shx"),
+    "simplex": ("simplex.shx", ""),
+    "arial": ("arial.ttf", ""),
+}
+
+
+@mcp.tool()
+def dxf_styles(path: str, styles: list[dict]) -> dict:
+    """创建/更新/删除文字样式——中文显示正确的关键。
+    默认样式 Standard 挂的是 txt.shx（无中文字形），CAD 里中文必乱码；
+    把文字挂到挂中文 TTF/SHX 字体的样式上即可。
+
+    Args:
+        path: DXF 文件（不存在会先创建）。
+        styles: 样式列表，每项:
+          name     (必填) 样式名，如 "ZHONGWEN"
+          preset   中文字体预设: 宋体/黑体/楷体/仿宋/gbcbig(SHX 双字体)，
+                   或直接给 font
+          font     字体文件名: TTF 如 "simsun.ttc"/"simhei.ttf"，SHX 如 "gbenor.shx"
+          bigfont  大字体（SHX 专用，如 "gbcbig.shx"；gbcbig 预设已含）
+          width    宽度因子（默认 1.0）
+          delete   true 时删除该样式
+    使用: dxf_draw 的 text/mtext 传 style 字段，或 dxf_modify 的 style 参数
+    给已有文字改样式。字体缺失时 AutoCAD 会弹替换对话框，任选一个中文字体
+    即可正常显示（文字按 Unicode 存储，换字体不丢字）。
+    """
+    try:
+        doc, _ = _load_or_create(path)
+        results = []
+        for spec in styles:
+            name = str(spec.get("name", "")).strip()
+            if not name:
+                return _err("每个样式必须给 name")
+            if spec.get("delete"):
+                if name in doc.styles:
+                    del doc.styles[name]
+                    results.append(f"deleted {name}")
+                else:
+                    results.append(f"{name} 不存在（跳过）")
+                continue
+            font = str(spec.get("font", ""))
+            bigfont = str(spec.get("bigfont", ""))
+            preset = str(spec.get("preset", "")).strip()
+            if preset:
+                if preset not in STYLE_PRESETS:
+                    return _err(f"未知预设 {preset!r}，可选: {sorted(STYLE_PRESETS)}")
+                font, bigfont = STYLE_PRESETS[preset]
+            if not font:
+                return _err(f"样式 {name} 缺 font/preset")
+            existed = name in doc.styles
+            st = (doc.styles.get(name) if existed
+                  else doc.styles.add(name, font=font))
+            st.dxf.font = font
+            if bigfont:
+                st.dxf.bigfont = bigfont
+            else:
+                try:
+                    del st.dxf.bigfont
+                except Exception:  # noqa: BLE001
+                    pass
+            st.dxf.width = float(spec.get("width", 1.0))
+            results.append(
+                f"{'updated' if existed else 'created'} {name}: font={font}"
+                + (f" bigfont={bigfont}" if bigfont else ""))
+        doc.saveas(str(_resolve(path)))
+        return _ok(path=path, results=results)
+    except Exception as e:  # noqa: BLE001
+        return _err(f"{type(e).__name__}: {e}")
 
 
 @mcp.tool()
@@ -827,6 +954,8 @@ def dxf_modify(
     color=None,
     linetype: str | None = None,
     text: str | None = None,
+    style: str | None = None,
+    lineweight: int | None = None,
     move: list[float] | None = None,
     rotate_deg: float | None = None,
     rotate_about: list[float] | None = None,
@@ -842,6 +971,10 @@ def dxf_modify(
         color: 新颜色（ACI 数字 / 颜色名 / #RRGGBB）
         linetype: 新线型（Continuous/Dashed/Center/Hidden/Phantom/Dashdot）
         text: 替换文字内容（仅 TEXT/MTEXT 有效）
+        style: 文字样式名（仅 TEXT/MTEXT 有效，样式需先用 dxf_styles 创建；
+            中文乱码就靠它：样式挂中文 TTF/SHX 字体）
+        lineweight: 线宽（1/100mm，如 50=0.5mm 粗实线 / 13=0.13mm 细线；
+            非标准值就近取标准档）。实体级线宽优先级高于图层线宽。
         move: [dx, dy] 平移
         rotate_deg: 旋转角度（度，逆时针为正）
         rotate_about: 旋转中心 [x, y]，默认 [0, 0]
@@ -892,6 +1025,22 @@ def dxf_modify(
             for e in targets:
                 e.dxf.text = str(text)
             applied.append(f"text={str(text)[:30]!r}")
+        if style is not None:
+            sname = str(style)
+            if sname not in doc.styles:
+                return _err(f"样式 {sname} 不存在（先用 dxf_styles 创建）")
+            bad = {e.dxftype() for e in targets
+                   if e.dxftype() not in ("TEXT", "MTEXT")}
+            if bad:
+                return _err(f"style 仅对 TEXT/MTEXT 有效，目标含 {sorted(bad)}")
+            for e in targets:
+                e.dxf.style = sname
+            applied.append(f"style={sname}")
+        if lineweight is not None:
+            lw = _lineweight(int(lineweight))
+            for e in targets:
+                e.dxf.lineweight = lw
+            applied.append(f"lineweight={lw}")
         # 变换：A*B = 先 A 后 B；绕点 = T(-c) * M * T(c)
         m: Matrix44 | None = None
         if move:
@@ -1107,6 +1256,8 @@ def _build_figure(doc, background: str, page_size: str):
     图块等默认色实体全部不可见。
     """
     bg = _bg_hex(background)
+    m = _mpl()
+    plt = m["plt"]
     fixed = str(page_size).upper() in ("A4", "A3", "A2")
     if fixed:
         # 横版纸张尺寸（英寸）；adjust_figure=False 防止 finalize 按
@@ -1114,17 +1265,17 @@ def _build_figure(doc, background: str, page_size: str):
         sizes = {"A4": (11.69, 8.27), "A3": (16.54, 11.69), "A2": (23.39, 16.54)}
         fig = plt.figure(figsize=sizes[str(page_size).upper()])
         ax = fig.add_axes([0.04, 0.04, 0.92, 0.92])
-        backend = MatplotlibBackend(ax, adjust_figure=False)
+        backend = m["MatplotlibBackend"](ax, adjust_figure=False)
     else:
         fig = plt.figure()
         ax = fig.add_axes([0.02, 0.02, 0.96, 0.96])
-        backend = MatplotlibBackend(ax)
-    config = Configuration(
-        background_policy=BackgroundPolicy.CUSTOM,
+        backend = m["MatplotlibBackend"](ax)
+    config = m["Configuration"](
+        background_policy=m["BackgroundPolicy"].CUSTOM,
         custom_bg_color=bg,
     )
-    ctx = RenderContext(doc)
-    frontend = Frontend(ctx, backend, config=config)
+    ctx = m["RenderContext"](doc)
+    frontend = m["Frontend"](ctx, backend, config=config)
     frontend.draw_layout(doc.modelspace(), finalize=True)
     ax.set_facecolor(bg)
     return fig, bg
@@ -1154,7 +1305,7 @@ def dxf_render(
         doc = ezdxf.readfile(str(p))
         fig, bg = _build_figure(doc, background, page_size="auto")
         fig.savefig(str(out), dpi=int(dpi), facecolor=bg)
-        plt.close(fig)
+        _mpl()["plt"].close(fig)
         return _ok(path=str(p), png=str(out), size_bytes=out.stat().st_size)
     except Exception as e:  # noqa: BLE001
         return _err(f"{type(e).__name__}: {e}")
@@ -1184,7 +1335,7 @@ def dxf_export_pdf(
         doc = ezdxf.readfile(str(p))
         fig, bg = _build_figure(doc, background, page_size)
         fig.savefig(str(out), facecolor=bg)
-        plt.close(fig)
+        _mpl()["plt"].close(fig)
         return _ok(path=str(p), pdf=str(out), size_bytes=out.stat().st_size,
                    page_size=str(page_size).upper() if page_size != "auto" else "auto-fit")
     except Exception as e:  # noqa: BLE001
@@ -1363,6 +1514,564 @@ def dxf_open_in_autocad(path: str, prefer: str | None = None) -> dict:
             return _ok(path=str(p), opened_with="system default",
                        note="未找到 AutoCAD，已用系统默认应用打开")
         return _err(f"打开失败: {(r.stderr or '').strip()}")
+    except Exception as e:  # noqa: BLE001
+        return _err(f"{type(e).__name__}: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# “算图脑”：制图几何计算工具（纯计算，不读写 DXF 文件）
+#
+# 面向《工程制图》同坡屋面类题目：
+#   已知屋檐线 H 面投影（封闭多边形）+ 坡面倾角 α →
+#   1) dxf_roof_solve        求屋面交线（3D：平面端点 + 高度 z）
+#   2) dxf_roof_three_view   求三面投影（第一角法 H/V/W，含可见性、
+#                            轮廓线、45° 辅助线/传递线，直接可画）
+#
+# 模型：每条檐线定义一个倾角 α 的斜面，屋面高度（建筑内部）
+#       h(P) = min{ d_e(P) | d_e(P) > 0 } · tanα
+#       d_e = P 到檐线 e 的有符号垂距（朝该檐线的建筑内侧为正）。
+#       屋面交线 = 两个檐面同时取最小值的“屋脊”轨迹。
+#       凹形多边形（内凹檐线）自动适用——内侧判定用“边中点+ε·法向”
+#       奇偶测试，不依赖质心。
+# ─────────────────────────────────────────────────────────────────────────
+
+def _pip(pt, poly) -> bool:
+    """点是否在多边形内（奇偶规则）。边界上返回 False。"""
+    x, y = pt
+    inside = False
+    n = len(poly)
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        if (yi > y) != (yj > y):
+            xint = (xj - xi) * (y - yi) / (yj - yi) + xi
+            if x < xint:
+                inside = not inside
+        j = i
+    return inside
+
+
+def _poly_size(poly) -> float:
+    return max(math.hypot(b[0] - a[0], b[1] - a[1])
+               for a, b in zip(poly, poly[1:] + poly[:1]))
+
+
+def _roof_edges(poly):
+    """每条檐线 → (端点 A, 指向建筑内侧的单位法向 n)。
+    d_e(P) = dot(P - A, n)，内侧为正。"""
+    eps = 1e-3 * _poly_size(poly)
+    edges = []
+    n = len(poly)
+    for i in range(n):
+        A, B = poly[i], poly[(i + 1) % n]
+        vx, vy = B[0] - A[0], B[1] - A[1]
+        L = math.hypot(vx, vy)
+        if L < 1e-12:
+            raise ValueError(f"檐线 {i} 长度为零（点 {A} 与 {B} 重合）")
+        nx, ny = vy / L, -vx / L
+        Mx, My = (A[0] + B[0]) / 2, (A[1] + B[1]) / 2
+        if not _pip((Mx + nx * eps, My + ny * eps), poly):
+            nx, ny = -nx, -ny
+        edges.append((A, (nx, ny)))
+    return edges
+
+
+def _roof_height(poly, edges, tan):
+    """h(P) 标量（建筑外部返回 None）与向量化 h_arr(X,Y)（外部 NaN）。
+
+    关键：必须先用奇偶测试判定“是否在建筑内部”，再取到各檐线内侧
+    垂距的最小值——凹口（内凹檐线围出的外部区域）里的点若不做此判定，
+    会被“内侧垂距取最小”误算出一个虚假的正高度。"""
+    import numpy as np
+
+    def h(P):
+        if not _pip(P, poly):
+            return None
+        v = [ (P[0] - A[0]) * n[0] + (P[1] - A[1]) * n[1] for A, n in edges ]
+        act = [d for d in v if d >= -1e-9]  # 含 0：檐口线上高度恰为 0
+        if not act:
+            return None
+        return min(act) * tan
+
+    def h_arr(X, Y):
+        dmin = None
+        for A, n in edges:
+            d = (X - A[0]) * n[0] + (Y - A[1]) * n[1]
+            d = np.where(d >= -1e-9, d, np.inf)
+            dmin = d if dmin is None else np.minimum(dmin, d)
+        # 奇偶测试（向量化）：建筑内部才有效
+        cnt = np.zeros(X.shape, dtype=np.int32)
+        m_ = len(poly)
+        for i in range(m_):
+            xi, yi = poly[i]
+            xj, yj = poly[(i + 1) % m_]
+            if yi == yj:
+                continue
+            m = (yi > Y) != (yj > Y)
+            xint = (xj - xi) * (Y - yi) / (yj - yi) + xi
+            cnt += np.where(m & (X < xint), 1, 0)
+        inside = (cnt % 2) == 1
+        return np.where(inside & np.isfinite(dmin), dmin, np.nan) * tan
+
+    h._arr = h_arr  # type: ignore[attr-defined]
+    return h
+
+
+def _line_intervals(p0, u, poly, tmin, tmax):
+    """直线 p0 + t·u 位于多边形内部的参数区间 [(t0,t1), ...]。"""
+    ts = []
+    n = len(poly)
+    ux, uy = u
+    for i in range(n):
+        A, B = poly[i], poly[(i + 1) % n]
+        ex, ey = B[0] - A[0], B[1] - A[1]
+        den = ux * ey - uy * ex
+        if abs(den) < 1e-12:
+            continue
+        t = ((A[0] - p0[0]) * ey - (A[1] - p0[1]) * ex) / den
+        s = ((A[0] - p0[0]) * uy - (A[1] - p0[1]) * ux) / den
+        if -1e-9 <= s <= 1.0 + 1e-9:
+            ts.append(t)
+    ts.sort()
+    ded = []
+    for t in ts:
+        if not ded or t - ded[-1] > 1e-6:
+            ded.append(t)
+    out = []
+    cand = [tmin] + ded + [tmax]
+    for a, b in zip(cand, cand[1:]):
+        if b - a < 1e-6:
+            continue
+        tm = 0.5 * (a + b)
+        if _pip((p0[0] + ux * tm, p0[1] + uy * tm), poly):
+            out.append((a, b))
+    return out
+
+
+def _roof_solve_core(poly, pitch_deg):
+    """同坡屋面核心求解。返回 dict：edges / tan / lines（3D 交线）。"""
+    edges = _roof_edges(poly)
+    tan = math.tan(math.radians(pitch_deg))
+    size = _poly_size(poly)
+
+    def d_k(P, k):
+        A, n = edges[k]
+        return (P[0] - A[0]) * n[0] + (P[1] - A[1]) * n[1]
+
+    lines = []
+    ne = len(edges)
+    for i in range(ne):
+        for j in range(i + 1, ne):
+            Ai, ni = edges[i]
+            Aj, nj = edges[j]
+            wx, wy = ni[0] - nj[0], ni[1] - nj[1]
+            wl = math.hypot(wx, wy)
+            if wl < 1e-9:
+                continue  # 平行檐线，斜面平行不相交
+            c = (Ai[0] * ni[0] + Ai[1] * ni[1]) - (Aj[0] * nj[0] + Aj[1] * nj[1])
+            # 平分线: dot(P, w) = c；方向 u ⊥ w
+            ux, uy = -wy / wl, wx / wl
+            p0 = (c * wx / (wl * wl), c * wy / (wl * wl))
+            # d_k(t) = a_k + t·b_k（线性）
+            a = [(p0[0] - A[0]) * n[0] + (p0[1] - A[1]) * n[1] for A, n in edges]
+            b = [ux * n[0] + uy * n[1] for _, n in edges]
+            def is_ridge(tm):
+                """t 处 P 是否位于 i、j 两檐面的共同最低（屋脊）上。
+                规则：h = min{d_e : d_e ≥ -eps}，故要求 d_i ≥ -eps，
+                且每个“激活”面（d_k ≥ -eps）都不低于 d_i；
+                非激活面（d_k < -eps，如凹口外侧延伸）不构成约束。"""
+                di = a[i] + b[i] * tm
+                if di < -1e-9:
+                    return False
+                for k in range(ne):
+                    if k in (i, j):
+                        continue
+                    dk = a[k] + b[k] * tm
+                    if dk > 1e-9 and dk < di - 1e-9:
+                        return False
+                return True
+
+            lo, hi = -10 * size, 10 * size
+            for (ta, tb) in _line_intervals(p0, (ux, uy), poly, lo, hi):
+                # 关键点：区间端点 + d_i=0 的根 + d_k=0 的根 + d_k=d_i 的根。
+                # 每个子区间内“激活面集合”与 d_i 的符号都不变，
+                # 中点判定即代表整段，端点由此精确（落在檐口/三面交汇点）。
+                crit = [ta, tb]
+                if abs(b[i]) > 1e-12:
+                    crit.append(-a[i] / b[i])
+                for k in range(ne):
+                    if k in (i, j):
+                        continue
+                    if abs(b[k]) > 1e-12:
+                        crit.append(-a[k] / b[k])
+                    B2 = b[k] - b[i]
+                    if abs(B2) > 1e-12:
+                        crit.append((a[i] - a[k]) / B2)
+                crit = sorted(t for t in crit if ta <= t <= tb)
+                parts = []
+                for s1, s2 in zip(crit, crit[1:]):
+                    if s2 - s1 < 1e-9:
+                        continue
+                    if is_ridge(0.5 * (s1 + s2)):
+                        if parts and abs(parts[-1][1] - s1) < 1e-9:
+                            parts[-1][1] = s2
+                        else:
+                            parts.append([s1, s2])
+                for (s1, s2) in parts:
+                    if s2 - s1 < 1e-6:
+                        continue
+                    lines.append({
+                        "p0": [round(p0[0] + ux * s1, 4),
+                               round(p0[1] + uy * s1, 4)],
+                        "z0": round((a[i] + b[i] * s1) * tan, 4),
+                        "p1": [round(p0[0] + ux * s2, 4),
+                               round(p0[1] + uy * s2, 4)],
+                        "z1": round((a[i] + b[i] * s2) * tan, 4),
+                        "eaves": [i, j],
+                    })
+    return {"edges": [list(A) + list(n) for A, n in edges],
+            "tan": round(tan, 6),
+            "lines": lines}
+
+
+def _fit_silhouette(poly, h, axis, tan):
+    """V/W 轮廓（上包络）：采样 → 分段拟合（斜率 ∈ {+tan, −tan, 0} 或竖直）。
+    返回 [{t:'s',x0,z0,x1,z1} | {t:'v',x,z0,z1}]（局部坐标）。"""
+    import numpy as np
+
+    x0 = min(p[0] for p in poly)
+    x1 = max(p[0] for p in poly)
+    y0 = min(p[1] for p in poly)
+    y1 = max(p[1] for p in poly)
+    step = 0.02
+    if axis == "V":
+        ts = np.arange(x0, x1 + step / 2, step)
+        other = np.arange(y0, y1 + step / 2, 0.15)
+        X, O = np.meshgrid(ts, other, indexing="ij")
+        Z = np.nanmax(h._arr(X, O), axis=1)
+    else:
+        ts = np.arange(y0, y1 + step / 2, step)
+        other = np.arange(x0, x1 + step / 2, 0.15)
+        X, O = np.meshgrid(other, ts, indexing="ij")
+        Z = np.nanmax(h._arr(X, O), axis=0)
+    zs = np.nan_to_num(Z, nan=-1e9)
+    # 去掉端点处因“恰在边界”产生的 NaN 尖刺
+    n = len(ts)
+    for end in (0, n - 1):
+        if zs[end] < -1e8:
+            for d in (1, -1):
+                q = end + d
+                if 0 <= q < n and zs[q] > -1e8:
+                    zs[end] = zs[q]
+                    break
+    segs = []
+    i = 0
+    while i < n - 1:
+        if abs(zs[i + 1] - zs[i]) > 0.35:
+            segs.append({"t": "v", "x": float(ts[i + 1]),
+                         "z0": float(zs[i]), "z1": float(zs[i + 1])})
+            i += 1
+            continue
+        best = None
+        for slope in (tan, -tan, 0.0):
+            j = i
+            while j < n - 1:
+                x0_, z0_ = ts[i], zs[i]
+                x1_, z1_ = ts[j + 1], zs[j + 1]
+                if abs(z1_ - (z0_ + slope * (x1_ - x0_))) > 0.06:
+                    break
+                j += 1
+            if best is None or (j - i) > (best[1] - i):
+                best = (slope, j)
+        slope, j = best
+        x0_, z0_ = float(ts[i]), float(zs[i])
+        x1_, z1_ = float(ts[j]), float(zs[i] + slope * (ts[j] - ts[i]))
+        if slope == 0.0:
+            z1_ = z0_
+        segs.append({"t": "s", "slope": slope, "x0": x0_, "z0": z0_,
+                     "x1": x1_, "z1": z1_})
+        i = j
+    # 合并同向相邻段 + 去掉过短段
+    m = []
+    for s in segs:
+        if m:
+            pm = m[-1]
+            if (s["t"] == "s" and pm["t"] == "s"
+                    and s["slope"] == pm["slope"]
+                    and abs(pm["z1"] - s["z0"]) < 0.06):
+                pm["x1"] = s["x1"]
+                pm["z1"] = s["z1"]
+                continue
+        m.append(s)
+    m = [s for s in m
+         if s["t"] == "v" or abs(s["x1"] - s["x0"]) > 0.15]
+    # 端点竖直段若只到 z≈0（轮廓与基线相接）保留；
+    # 修正微小 z 误差（端点吸附）
+    for s in m:
+        for k in ("z0", "z1"):
+            s[k] = round(s[k], 3)
+        if s["t"] == "s":
+            s["x0"] = round(s["x0"], 3)
+            s["x1"] = round(s["x1"], 3)
+            if abs(s["z1"] - s["z0"]) < 0.05:
+                s["z1"] = s["z0"]
+        else:
+            s["x"] = round(s["x"], 3)
+    return m
+
+
+def _view_runs(poly, edges, h, line3d, axis):
+    """一条 3D 交线在 V 或 W 视图中的投影分段 + 可见性。
+    返回 [(p0_2d, p1_2d, visible)]（2D 为局部坐标：V=(x,z)，W=(y,z)）。"""
+    import numpy as np
+
+    (x0, y0), (x1, y1) = line3d["p0"], line3d["p1"]
+    z0, z1 = line3d["z0"], line3d["z1"]
+    xmin, xmax = min(p[0] for p in poly), max(p[0] for p in poly)
+    ymin, ymax = min(p[1] for p in poly), max(p[1] for p in poly)
+    N = 33
+    ts = np.linspace(0.0, 1.0, N)
+    xs = x0 + (x1 - x0) * ts
+    ys = y0 + (y1 - y0) * ts
+    zs = z0 + (z1 - z0) * ts
+    harr = h._arr
+    vis = np.ones(N, dtype=bool)
+    if axis == "V":
+        # 视点在 −y 方向：被 y'<y 处更高的屋面遮挡
+        scan = np.arange(ymin, ymax + 0.125, 0.25)
+        for k in range(N):
+            m = (scan <= ys[k]) & (scan > ymin - 1e-9)
+            if not m.any():
+                continue
+            Xs = np.full(int(m.sum()), xs[k])
+            Ys = scan[m]
+            hv = harr(Xs, Ys)
+            vis[k] = not (np.nanmax(hv) > zs[k] + 0.02)
+    else:
+        # 左视图：视点在 −x 方向：被 x'<x 处更高的屋面遮挡
+        scan = np.arange(xmin, xmax + 0.125, 0.25)
+        for k in range(N):
+            m = (scan <= xs[k]) & (scan > xmin - 1e-9)
+            if not m.any():
+                continue
+            Xs = scan[m]
+            Ys = np.full(int(m.sum()), ys[k])
+            hv = harr(Xs, Ys)
+            vis[k] = not (np.nanmax(hv) > zs[k] + 0.02)
+    runs = []
+    k = 0
+    while k < N - 1:
+        q = k
+        while q < N - 1 and vis[q + 1] == vis[k]:
+            q += 1
+        if q > k:
+            t0, t1 = ts[k], ts[q]
+            runs.append(((x0 + (x1 - x0) * t0, y0 + (y1 - y0) * t0),
+                         (x0 + (x1 - x0) * t1, y0 + (y1 - y0) * t1),
+                         bool(vis[k])))
+        k = q + 1  # 单点 run 也要前进，否则死循环
+    return runs
+
+
+
+
+@mcp.tool()
+def dxf_roof_solve(polygon: list[list[float]], pitch_deg: float = 30.0) -> dict:
+    """【算图】同坡屋面交线求解（纯计算，不写文件）。
+
+    已知：屋檐线的 H 面投影（封闭多边形，按序给出，顺/逆时针均可）
+    与坡面倾角 α。每条檐线定义一个倾角 α 的斜面，屋面交线即相邻
+    檐面的交线（屋脊线）。自动处理内凹檐线（凹口），交线端点精确
+    到檐口/三面交汇点（无采样误差）。
+
+    Args:
+        polygon: [[x, y], ...] 檐线顶点（H 面投影，任意单位，建议 mm）。
+        pitch_deg: 坡面倾角（度），默认 30。
+
+    返回:
+        tan:      tan(α)
+        edges:    每条檐线的端点与内侧单位法向 [[ax,ay,nx,ny], ...]
+        lines:    屋面交线（3D），每条:
+                  p0/p1 平面端点 [x,y]，z0/z1 对应端点高度，
+                  eaves [i, j] 该交线由第 i、j 条檐线决定
+        max_z:    屋面最高高度
+    """
+    try:
+        poly = [[float(p[0]), float(p[1])] for p in polygon]
+        if len(poly) < 4:
+            return _err("polygon 至少 4 个点")
+        if not (0 < pitch_deg < 90):
+            return _err("pitch_deg 必须在 0~90 度之间")
+        r = _roof_solve_core(poly, float(pitch_deg))
+        return _ok(
+            tan=r["tan"],
+            edges=r["edges"],
+            lines=r["lines"],
+            line_count=len(r["lines"]),
+            max_z=round(max((v for ln in r["lines"]
+                             for v in (ln["z0"], ln["z1"])), default=0.0), 4),
+        )
+    except Exception as e:  # noqa: BLE001
+        return _err(f"{type(e).__name__}: {e}")
+
+
+@mcp.tool()
+def dxf_roof_three_view(
+    polygon: list[list[float]],
+    pitch_deg: float = 30.0,
+    h_origin: list[float] = None,
+    gap_v: float = 18.0,
+    gap_w: float = 0.0,
+    with_transfer: bool = True,
+) -> dict:
+    """【算图】同坡屋面三面投影（第一角法，纯计算，不写文件）。
+
+    在 dxf_roof_solve 的基础上，直接给出可画图的纸面坐标：
+    H（俯视图）在 h_origin，V（主视图）在 H 正上方（共 x 轴），
+    W（左视图）在 V 右侧、共基线；W 视图 y 轴翻转（物体前表面在右）。
+    含：各视图轮廓线（含凹口墙竖直轮廓边）、交线投影（逐段可见性：
+    可见=粗实线/隐藏=细虚线）、45° 辅助线与角点传递线。
+
+    Args:
+        polygon:     同 dxf_roof_solve。
+        pitch_deg:   坡面倾角（度），默认 30。
+        h_origin:    H 视图局部原点（多边形 xmin,ymin）的纸面坐标
+                     [px, py]（y 向下为正，DXF 坐标）。
+                     缺省 [0, 0]。
+        gap_v:       H 视图顶边到 V 基线的间距（默认 18）。
+        gap_w:       V 视图右边到 W 视图左边的间距（默认 0，紧贴）。
+        with_transfer: 是否输出 45° 辅助线/传递线（默认 True）。
+
+    返回（所有坐标均为纸面坐标，可直接喂给 dxf_draw）:
+        layout:  H0/V_base/W_left/W_extent/D_extent/xmin... 布局参数
+        H:       {polygon: [[x,y],...], lines: [[[x0,y0],[x1,y1]],...]}
+        V:       {baseline: [[x0,y0],[x1,y1]],
+                  silhouette: [[x0,y0],[x1,y1],...],
+                  lines: [[[x0,y0],[x1,y1], visible, eaves], ...]}
+        W:       同 V（局部坐标按 y 翻转）
+        construction: {line45, trans_v, trans_w, trans_w_up}
+        max_z / tan / 说明
+    """
+    try:
+        poly = [[float(p[0]), float(p[1])] for p in polygon]
+        if len(poly) < 4:
+            return _err("polygon 至少 4 个点")
+        if not (0 < pitch_deg < 90):
+            return _err("pitch_deg 必须在 0~90 度之间")
+        H0x, H0y = (h_origin or [0, 0])
+        xmin = min(p[0] for p in poly)
+        xmax = max(p[0] for p in poly)
+        ymin = min(p[1] for p in poly)
+        ymax = max(p[1] for p in poly)
+        Wext = xmax - xmin
+        Dext = ymax - ymin
+        V_base = H0y - gap_v
+        V_right = H0x + Wext
+        W_left = V_right + gap_w
+
+        def H(x, y):
+            return [round(H0x + (x - xmin), 3), round(H0y + (y - ymin), 3)]
+
+        def V(x, z):
+            return [round(H0x + (x - xmin), 3), round(V_base - z, 3)]
+
+        def Wv(y, z):
+            return [round(W_left + (ymax - y), 3), round(V_base - z, 3)]
+
+        edges = _roof_edges(poly)
+        tan = math.tan(math.radians(pitch_deg))
+        h = _roof_height(poly, edges, tan)
+        sol = _roof_solve_core(poly, float(pitch_deg))
+
+        # --- H 视图 ---
+        Hview = {
+            "polygon": [H(x, y) for x, y in poly],
+            "lines": [[list(H(ln["p0"][0], ln["p0"][1])),
+                        list(H(ln["p1"][0], ln["p1"][1]))]
+                       for ln in sol["lines"]],
+        }
+        # --- V / W 视图 ---
+        silV = _fit_silhouette(poly, h, "V", tan)
+        silW = _fit_silhouette(poly, h, "W", tan)
+        Vview = {
+            "baseline": [[H0x, V_base], [H0x + Wext, V_base]],
+            "silhouette": [
+                [[H0x + s["x0"], V_base - s["z0"]],
+                 [H0x + s["x1"], V_base - s["z1"]]]
+                if s["t"] == "s" else
+                [[H0x + s["x"], V_base - s["z0"]],
+                 [H0x + s["x"], V_base - s["z1"]]]
+                for s in silV],
+            "lines": [],
+        }
+        Wview = {
+            "baseline": [[W_left, V_base], [W_left + Dext, V_base]],
+            "silhouette": [
+                [[W_left + (ymax - s["x0"]), V_base - s["z0"]],
+                 [W_left + (ymax - s["x1"]), V_base - s["z1"]]]
+                if s["t"] == "s" else
+                [[W_left + (ymax - s["x"]), V_base - s["z0"]],
+                 [W_left + (ymax - s["x"]), V_base - s["z1"]]]
+                for s in silW],
+            "lines": [],
+        }
+        # 交线投影：z 由端点线性插值（run 端点参数已知）
+        for ln in sol["lines"]:
+            (x0, y0), (x1, y1) = ln["p0"], ln["p1"]
+            z0, z1 = ln["z0"], ln["z1"]
+
+            def _zt(xa, ya, xb, yb):
+                # 按主导轴插值 z（避免 plan 竖直/水平线的除零）
+                if abs(x1 - x0) > abs(y1 - y0):
+                    return (z0 + (z1 - z0) * (xa - x0) / (x1 - x0),
+                            z0 + (z1 - z0) * (xb - x0) / (x1 - x0))
+                return (z0 + (z1 - z0) * (ya - y0) / (y1 - y0),
+                        z0 + (z1 - z0) * (yb - y0) / (y1 - y0))
+
+            for run in _view_runs(poly, edges, h, ln, "V"):
+                (xa, ya), (xb, yb), vis = run
+                za, zb = _zt(xa, ya, xb, yb)
+                Vview["lines"].append(
+                    [V(xa, za), V(xb, zb), vis, ln["eaves"]])
+            for run in _view_runs(poly, edges, h, ln, "W"):
+                (xa, ya), (xb, yb), vis = run
+                za, zb = _zt(xa, ya, xb, yb)
+                # W 视图横轴 = plan 的 y（前表面 y=0 在右）
+                Wview["lines"].append(
+                    [Wv(ya, za), Wv(yb, zb), vis, ln["eaves"]])
+        # --- 作图辅助线 ---
+        constr = {}
+        if with_transfer:
+            ext = Dext + 15
+            constr["line45"] = [[V_right, H0y + Dext],
+                                [V_right + ext, H0y - (ext - Dext)]]
+            constr["trans_v"] = [
+                [H(x, y), [H(x, y)[0], V_base - 0.8]] for x, y in poly]
+            constr["trans_w"] = []
+            constr["trans_w_up"] = []
+            for x, y in poly:
+                hx, hy = H(x, y)
+                tx = round(V_right + (ymax - y), 3)
+                constr["trans_w"].append([[hx, hy], [tx, hy]])
+                constr["trans_w_up"].append([[tx, hy], [tx, V_base - 0.8]])
+        return _ok(
+            layout={
+                "H0": [H0x, H0y], "V_base": round(V_base, 3),
+                "W_left": round(W_left, 3), "W_extent": round(Wext, 3),
+                "D_extent": round(Dext, 3),
+                "xmin": xmin, "xmax": xmax, "ymin": ymin, "ymax": ymax,
+            },
+            H=Hview, V=Vview, W=Wview,
+            construction=constr,
+            tan=round(tan, 6),
+            max_z=sol.get("max_z") or round(max(
+                (v for ln in sol["lines"] for v in (ln["z0"], ln["z1"])),
+                default=0.0), 4),
+            line_count=len(sol["lines"]),
+            note="可见性: V 视点在 -y（前），W 视点在 -x（左）；"
+                 "visible=True 画粗实线，False 画细虚线（隐藏线）",
+        )
     except Exception as e:  # noqa: BLE001
         return _err(f"{type(e).__name__}: {e}")
 
